@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.env
+
+# Hugging Face / Models
+# Ignore training checkpoints and large optimizer states
+checkpoint-*/
+optimizer.pt
+scheduler.pt
+rng_state.pth
+trainer_state.json
+
+# Ignore unused models for current deployment (missing dependencies in requirements.txt)
+model/fakeImage_model/
+model/fakeAudio_model/
+model/cardFraud_model/
+*.keras
+*.h5
+*.pkl
+
+# Keep phising_model as it is used in Dockerfile
+# !model/phising_model/

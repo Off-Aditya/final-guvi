@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+.git
+.gitignore
+.gitattributes
+model/cardFraud_model
+model/fakeAudio_model
+model/fakeImage_model
+*.ipynb
+uploads/*
