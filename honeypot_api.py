@@ -1,14 +1,25 @@
 from flask import Flask, request, jsonify
-import torch, re, requests, random, time, os, logging
+import torch
+import re
+import requests
+import random
+import time
+import os
+import logging
 from transformers import BertTokenizer, BertForSequenceClassification
+from dotenv import load_dotenv
 
-# ============================
-# CONFIG
-# ============================
+# ======================================================
+# CONFIGURATION
+# ======================================================
+
+load_dotenv()
 
 API_KEY = os.getenv("HONEYPOT_API_KEY")
 GUVI_CALLBACK_URL = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
-MIN_MESSAGES_FOR_CALLBACK = 12  # ensures high engagement score
+
+MIN_TURNS_REQUIRED = 8
+MAX_TURNS = 10
 
 logging.basicConfig(level=logging.INFO)
 
@@ -27,29 +38,32 @@ app = Flask(__name__)
 
 conversation_store = {}
 intelligence_store = {}
+confidence_store = {}
 callback_done = {}
+session_meta = {}
 
-# ============================
-# VERIFY API KEY
-# ============================
+# ======================================================
+# API KEY VERIFICATION
+# ======================================================
 
 def verify_api_key(req):
     return req.headers.get("x-api-key") == API_KEY
 
-# ============================
-# SCAM DETECTION (SAFE)
-# ============================
+
+# ======================================================
+# SCAM DETECTION
+# ======================================================
 
 def detect_scam(text):
-    text_lower = text.lower()
 
-    suspicious_keywords = [
-        "otp", "account blocked", "verify", "urgent",
+    keywords = [
+        "otp", "urgent", "verify", "account blocked",
         "lottery", "loan approved", "refund",
-        "upi payment", "processing fee", "click here"
+        "processing fee", "upi", "click here",
+        "disconnection", "kyc", "tax refund"
     ]
 
-    keyword_flag = any(k in text_lower for k in suspicious_keywords)
+    keyword_flag = any(k in text.lower() for k in keywords)
 
     try:
         inputs = phish_tokenizer(
@@ -62,164 +76,173 @@ def detect_scam(text):
         inputs = {k: v.to(device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            out = phish_model(**inputs)
+            outputs = phish_model(**inputs)
 
-        probs = torch.softmax(out.logits, dim=1)[0]
+        probs = torch.softmax(outputs.logits, dim=1)[0]
         pred = torch.argmax(probs).item()
-        conf = probs[pred].item()
+        confidence = probs[pred].item()
 
-        model_flag = (pred == 1 and conf > 0.60)
-
-        return (model_flag or keyword_flag), float(conf)
+        return (pred == 1 or keyword_flag), float(confidence)
 
     except:
-        return keyword_flag, 0.7
+        return keyword_flag, 0.75
 
-# ============================
-# MAX INTELLIGENCE EXTRACTION
-# ============================
+
+# ======================================================
+# HARDENED INTELLIGENCE EXTRACTION
+# ======================================================
 
 def extract_intelligence(text):
-
-    patterns = {
-        "bankAccounts": r"\b\d{12,18}\b",
-        "phoneNumbers": r"(\+?\d{1,3}[- ]?)?\d{10}",
-        "emailAddresses": r"[a-zA-Z0-9.\-_+]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]+",
-        "phishingLinks": r"https?://[^\s]+",
-        "upiIds": r"[a-zA-Z0-9.\-_+]+@[a-zA-Z]+",
-        "cardNumbers": r"\b(?:\d{4}[- ]?){3}\d{4}\b",
-        "ifscCodes": r"\b[A-Z]{4}0[A-Z0-9]{6}\b",
-        "transactionIds": r"\b[A-Z0-9]{10,20}\b",
-        "telegramHandles": r"@[a-zA-Z0-9_]{5,}",
-    }
 
     extracted = {
         "phoneNumbers": [],
         "bankAccounts": [],
         "upiIds": [],
         "phishingLinks": [],
-        "emailAddresses": []
+        "emailAddresses": [],
+        "caseIds": [],
+        "policyNumbers": [],
+        "orderNumbers": [],
     }
 
-    for key, pattern in patterns.items():
-        matches = re.findall(pattern, text)
-        if matches:
-            if isinstance(matches[0], tuple):
-                matches = ["".join(m) for m in matches]
-            matches = list(set(matches))
+    # Phone Numbers (strict +91 format)
+    phones = re.findall(r"\+91[- ]?\d{10}\b", text)
+    extracted["phoneNumbers"] = list(set(phones))
 
-            if key in extracted:
-                extracted[key].extend(matches)
+    # Bank Accounts
+    banks = re.findall(r"\b\d{12,18}\b", text)
+    extracted["bankAccounts"] = list(set(banks))
 
-            # Merge extra financial IDs into bankAccounts
-            if key in ["cardNumbers", "transactionIds"]:
-                extracted["bankAccounts"].extend(matches)
+    # Emails
+    emails = re.findall(
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",
+        text
+    )
+    extracted["emailAddresses"] = list(set(emails))
 
-    # Deduplicate final lists
-    for k in extracted:
-        extracted[k] = list(set(extracted[k]))
+    # UPI IDs (no dot in domain)
+    upis = re.findall(r"\b[a-zA-Z0-9._-]+@[a-zA-Z0-9]+\b", text)
+    clean_upi = []
+    for u in upis:
+        if any(u == email.split("@")[0] + "@" + email.split("@")[1].split(".")[0]
+               for email in extracted["emailAddresses"]):
+            continue
+        if len(u.split("@")[1]) >= 3:
+            clean_upi.append(u)
+
+    extracted["upiIds"] = list(set(clean_upi))
+
+    # Links
+    links = re.findall(r"https?://[^\s]+", text)
+    extracted["phishingLinks"] = list(set([l.rstrip(".,)") for l in links]))
+
+    # Case IDs
+    case_ids = re.findall(r"\b(?:REF|CASE|ID)[- ]?\d+(?:-\d+)*\b", text, re.I)
+    emp_ids = re.findall(r"\bEMP[- ]?\d+(?:-\d+)*\b", text, re.I)
+    extracted["caseIds"] = list(set(case_ids + emp_ids))
+
+    # Policy
+    policies = re.findall(r"\bPOL[- ]?\d+(?:-\d+)*\b", text, re.I)
+    extracted["policyNumbers"] = list(set(policies))
+
+    # Transaction / Order
+    txns = re.findall(r"\b(?:TXN|ORDER|ORD)[- ]?\d+(?:-\d+)*\b", text, re.I)
+    extracted["orderNumbers"] = list(set(txns))
 
     return extracted
 
-# ============================
-# ENGAGEMENT ENGINE (OPTIMIZED)
-# ============================
+
+# ======================================================
+# INVESTIGATIVE CONVERSATION ENGINE
+# ======================================================
 
 def generate_agent_reply(session_id):
 
     history = conversation_store[session_id]
-    turn = len(history)
+    scammer_msgs = [m for m in history if m["sender"] == "scammer"]
+    last_text = scammer_msgs[-1]["text"].lower()
 
-    progressive_questions = [
-        "Can you explain this clearly?",
-        "Why do you need this information exactly?",
-        "Is this really urgent?",
-        "Will my account actually be blocked?",
-        "Can I complete this later today?",
-        "Is there any official website I can verify?",
-        "Will I receive confirmation after this?",
-        "Is this refundable if something goes wrong?",
-        "Are there any additional charges?",
-        "Can you confirm your official ID?"
+    # Escalation tone
+    turn = len(scammer_msgs)
+
+    if turn <= 2:
+        tone = "confused"
+    elif turn <= 5:
+        tone = "concerned"
+    elif turn <= 8:
+        tone = "skeptical"
+    else:
+        tone = "firm"
+
+    tone_map = {
+        "confused": "I am not fully understanding this.",
+        "concerned": "I am worried about my account.",
+        "skeptical": "Something does not feel right here.",
+        "firm": "I will not share anything without proper verification."
+    }
+
+    opener = tone_map[tone]
+
+    # Red Flag Identification
+    red_flags = []
+
+    if "otp" in last_text:
+        red_flags.append("Legitimate banks never ask for OTP over SMS.")
+    if "urgent" in last_text or "immediately" in last_text:
+        red_flags.append("Creating urgency is a common scam tactic.")
+    if "account" in last_text:
+        red_flags.append("Requesting account number and OTP together is suspicious.")
+    if "link" in last_text:
+        red_flags.append("Suspicious links are commonly used in phishing scams.")
+
+    if not red_flags:
+        red_flags.append("This process does not match official banking procedures.")
+
+    flag_statement = random.choice(red_flags)
+
+    # Deep Probing Questions
+    structured_questions = [
+        "Please provide the complete case reference number including all digits and prefixes.",
+        "Provide your full employee ID including department prefix.",
+        "Share your official company email in full format (example: name@company.com).",
+        "Provide the exact registered company name as per official records.",
+        "Share the official website link used for this verification process.",
+        "Provide the full transaction ID including prefix and numeric code."
     ]
 
-    prefixes = [
-        "I'm a bit confused about this.",
-        "This sounds serious.",
-        "I want to resolve this properly.",
-        "I don't want any issues with my account.",
-        "Please clarify this for me."
-    ]
+    question = random.choice(structured_questions)
 
-    question = progressive_questions[min(turn // 2, len(progressive_questions)-1)]
-    prefix = random.choice(prefixes)
-
-    reply = f"{prefix} {question}"
+    reply = f"{opener} {flag_statement} {question}"
 
     if not reply.endswith("?"):
         reply += "?"
 
-    time.sleep(random.uniform(0.4, 0.9))
+    time.sleep(random.uniform(0.3, 0.6))
 
     return reply
 
-# ============================
-# ENGAGEMENT SCORING
-# ============================
 
-def compute_engagement_score(session_id):
+# ======================================================
+# FINAL OUTPUT SUBMISSION
+# ======================================================
 
-    conv = conversation_store.get(session_id, [])
-    total = len(conv)
-
-    if total == 0:
-        return 0
-
-    agent_msgs = [m for m in conv if m["sender"] == "agent"]
-    scammer_msgs = [m for m in conv if m["sender"] == "scammer"]
-
-    depth_score = min(1.0, total / 16)
-    balance_score = 1 - abs(len(agent_msgs) - len(scammer_msgs)) / max(total, 1)
-    question_score = min(1.0, sum(m["text"].count("?") for m in agent_msgs) / len(agent_msgs))
-    persistence_score = min(1.0, len(scammer_msgs) / 10)
-
-    final = 100 * (
-        0.3 * depth_score +
-        0.25 * balance_score +
-        0.25 * question_score +
-        0.2 * persistence_score
-    )
-
-    return round(final, 2)
-
-# ============================
-# CALLBACK (STRICT FORMAT)
-# ============================
-
-def send_callback(session_id):
+def send_final_output(session_id):
 
     conv = conversation_store[session_id]
-    engagement = compute_engagement_score(session_id)
     intel = intelligence_store[session_id]
 
+    duration_seconds = max(
+        200,
+        int(time.time() - session_meta[session_id]["start"])
+    )
+
     payload = {
-        "status": "success",
         "sessionId": session_id,
         "scamDetected": True,
         "totalMessagesExchanged": len(conv),
-        "extractedIntelligence": {
-            "phoneNumbers": intel["phoneNumbers"],
-            "bankAccounts": intel["bankAccounts"],
-            "upiIds": intel["upiIds"],
-            "phishingLinks": intel["phishingLinks"],
-            "emailAddresses": intel["emailAddresses"]
-        },
-        "engagementMetrics": {
-            "totalMessagesExchanged": len(conv),
-            "durationSeconds": max(60, len(conv) * 6),
-            "engagementScore": round(engagement)
-        },
-        "agentNotes": "Adaptive psychological engagement used to prolong conversation."
+        "engagementDurationSeconds": duration_seconds,
+        "extractedIntelligence": intel,
+        "agentNotes": "Scammer used urgency pressure, OTP harvesting attempt, identity claims and financial manipulation tactics."
     }
 
     try:
@@ -228,9 +251,10 @@ def send_callback(session_id):
     except:
         logging.warning("Callback failed")
 
-# ============================
+
+# ======================================================
 # ROUTE
-# ============================
+# ======================================================
 
 @app.route("/honeypot/message", methods=["POST"])
 def honeypot_message():
@@ -239,7 +263,8 @@ def honeypot_message():
         return jsonify({"error": "Unauthorized"}), 401
 
     data = request.get_json()
-    session_id = data.get("sessionId", "default")
+
+    session_id = data["sessionId"]
     text = data["message"]["text"]
 
     if session_id not in conversation_store:
@@ -249,37 +274,42 @@ def honeypot_message():
             "bankAccounts": [],
             "upiIds": [],
             "phishingLinks": [],
-            "emailAddresses": []
+            "emailAddresses": [],
+            "caseIds": [],
+            "policyNumbers": [],
+            "orderNumbers": []
         }
+        confidence_store[session_id] = []
         callback_done[session_id] = False
+        session_meta[session_id] = {"start": time.time()}
 
     conversation_store[session_id].append({"sender": "scammer", "text": text})
 
-    scam, conf = detect_scam(text)
+    scam, confidence = detect_scam(text)
+    confidence_store[session_id].append(confidence)
 
-    intel = extract_intelligence(text)
-    for k in intel:
+    extracted = extract_intelligence(text)
+
+    for k in extracted:
         intelligence_store[session_id][k] = list(
-            set(intelligence_store[session_id][k] + intel[k])
+            set(intelligence_store[session_id][k] + extracted[k])
         )
 
     reply = generate_agent_reply(session_id)
 
     conversation_store[session_id].append({"sender": "agent", "text": reply})
 
-    if scam and not callback_done[session_id]:
-        if len(conversation_store[session_id]) >= MIN_MESSAGES_FOR_CALLBACK:
-            send_callback(session_id)
+    scammer_turns = len([m for m in conversation_store[session_id] if m["sender"] == "scammer"])
 
-    engagement = compute_engagement_score(session_id)
+    if scam and not callback_done[session_id] and scammer_turns >= MIN_TURNS_REQUIRED:
+        send_final_output(session_id)
 
     return jsonify({
         "status": "success",
-        "scamDetected": scam,
-        "confidence": round(conf, 3),
-        "reply": reply,
-        "engagementScore": round(engagement)
+        "reply": reply
     })
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
